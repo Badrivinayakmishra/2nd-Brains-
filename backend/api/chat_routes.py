@@ -1,199 +1,772 @@
 """
-Chat API routes with streaming support.
+Chat History API Routes
+REST endpoints for managing chat conversations and messages.
+Provides tenant-isolated chat history persistence.
 """
-from typing import Optional, List
-from uuid import UUID
-from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from sqlalchemy.ext.asyncio import AsyncSession
+from flask import Blueprint, request, jsonify, g
+from datetime import datetime, timezone
+from typing import Optional, Dict, Tuple
+from collections import defaultdict
+import time
+from functools import wraps
+from sqlalchemy import func
+from sqlalchemy.orm import joinedload
 
-from database import get_db, Tenant
-from services.chat_service import ChatService
-from api.auth_routes import get_current_tenant
-
-router = APIRouter(prefix="/chat", tags=["Chat"])
-
-
-# ============== Schemas ==============
-
-class SessionCreate(BaseModel):
-    title: Optional[str] = None
+from database.models import (
+    SessionLocal, ChatConversation, ChatMessage, User
+)
+from services.auth_service import require_auth
 
 
-class SessionResponse(BaseModel):
-    id: UUID
-    title: Optional[str]
-    created_at: datetime
-    updated_at: datetime
+# Create blueprint
+chat_bp = Blueprint('chat', __name__, url_prefix='/api/chat')
 
-    class Config:
-        from_attributes = True
+# Constants for validation
+MAX_MESSAGE_LENGTH = 50000  # 50KB max message size
+MAX_TITLE_LENGTH = 255
+MAX_BULK_IDS = 100
 
+# Rate limiting configuration
+RATE_LIMIT_WINDOW = 60  # seconds
+RATE_LIMITS = {
+    'create_conversation': 30,    # 30 new conversations per minute
+    'add_message': 60,            # 60 messages per minute
+    'list_conversations': 120,    # 120 list requests per minute
+    'search': 30,                 # 30 searches per minute
+    'default': 60                 # default limit
+}
 
-class MessageResponse(BaseModel):
-    id: UUID
-    role: str
-    content: str
-    sources: Optional[List[str]]
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
-class ChatRequest(BaseModel):
-    message: str
+# Simple in-memory rate limiter (use Redis for production multi-instance)
+_rate_limit_store: Dict[str, Dict[str, Tuple[int, float]]] = defaultdict(dict)
 
 
-class ChatResponse(BaseModel):
-    message: str
-    sources: List[dict]
-    message_id: str
+def rate_limit(action: str = 'default'):
+    """Rate limiting decorator for chat endpoints"""
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            # Get user identifier
+            user_key = f"{g.tenant_id}:{g.user_id}"
+            limit = RATE_LIMITS.get(action, RATE_LIMITS['default'])
+
+            now = time.time()
+            store = _rate_limit_store[action]
+
+            # Get current count and window start
+            count, window_start = store.get(user_key, (0, now))
+
+            # Reset if window expired
+            if now - window_start >= RATE_LIMIT_WINDOW:
+                count = 0
+                window_start = now
+
+            # Check limit
+            if count >= limit:
+                return jsonify({
+                    "success": False,
+                    "error": f"Rate limit exceeded. Max {limit} requests per minute for this action."
+                }), 429
+
+            # Increment counter
+            store[user_key] = (count + 1, window_start)
+
+            return f(*args, **kwargs)
+        return wrapper
+    return decorator
 
 
-# ============== Routes ==============
-
-@router.get("/sessions", response_model=List[SessionResponse])
-async def list_sessions(
-    limit: int = 20,
-    offset: int = 0,
-    tenant: Tenant = Depends(get_current_tenant),
-    db: AsyncSession = Depends(get_db)
-):
-    """List chat sessions."""
-    service = ChatService(db)
-    sessions = await service.get_sessions(tenant.id, limit, offset)
-    return [SessionResponse.model_validate(s) for s in sessions]
+def get_db():
+    """Get database session"""
+    return SessionLocal()
 
 
-@router.post("/sessions", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
-async def create_session(
-    data: SessionCreate,
-    tenant: Tenant = Depends(get_current_tenant),
-    db: AsyncSession = Depends(get_db)
-):
-    """Create a new chat session."""
-    service = ChatService(db)
-    session = await service.create_session(tenant.id, data.title)
-    return SessionResponse.model_validate(session)
+def generate_title_from_content(content: str) -> str:
+    """Generate a short title from message content"""
+    import re
+
+    # Clean up content - remove file paths, URLs, and special characters
+    cleaned = content.strip()
+
+    # Remove file paths (Unix and Windows)
+    cleaned = re.sub(r'[/\\][\w\-. /\\]+\.\w+', '', cleaned)
+    cleaned = re.sub(r'^/Users/[^\s]+', '', cleaned)
+    cleaned = re.sub(r'^C:\\[^\s]+', '', cleaned)
+
+    # Remove URLs
+    cleaned = re.sub(r'https?://\S+', '', cleaned)
+
+    # Remove extra whitespace
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+    # If nothing left after cleaning, use generic title
+    if not cleaned or len(cleaned) < 3:
+        return "New conversation"
+
+    # Take first 50 chars, cut at last complete word
+    if len(cleaned) <= 50:
+        return cleaned
+    truncated = cleaned[:50]
+    last_space = truncated.rfind(' ')
+    if last_space > 20:
+        return truncated[:last_space] + "..."
+    return truncated + "..."
 
 
-@router.get("/sessions/{session_id}", response_model=SessionResponse)
-async def get_session(
-    session_id: UUID,
-    tenant: Tenant = Depends(get_current_tenant),
-    db: AsyncSession = Depends(get_db)
-):
-    """Get a chat session."""
-    service = ChatService(db)
-    session = await service.get_session(session_id, tenant.id)
+# ============================================================================
+# CONVERSATIONS
+# ============================================================================
 
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Session not found"
-        )
-
-    return SessionResponse.model_validate(session)
-
-
-@router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_session(
-    session_id: UUID,
-    tenant: Tenant = Depends(get_current_tenant),
-    db: AsyncSession = Depends(get_db)
-):
-    """Delete a chat session."""
-    service = ChatService(db)
-    deleted = await service.delete_session(session_id, tenant.id)
-
-    if not deleted:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Session not found"
-        )
-
-
-@router.get("/sessions/{session_id}/messages", response_model=List[MessageResponse])
-async def get_messages(
-    session_id: UUID,
-    tenant: Tenant = Depends(get_current_tenant),
-    db: AsyncSession = Depends(get_db)
-):
-    """Get messages for a session."""
-    service = ChatService(db)
-
-    # Verify session belongs to tenant
-    session = await service.get_session(session_id, tenant.id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Session not found"
-        )
-
-    messages = await service.get_messages(session_id)
-    return [MessageResponse.model_validate(m) for m in messages]
-
-
-@router.post("/sessions/{session_id}/chat", response_model=ChatResponse)
-async def chat(
-    session_id: UUID,
-    request: ChatRequest,
-    tenant: Tenant = Depends(get_current_tenant),
-    db: AsyncSession = Depends(get_db)
-):
+@chat_bp.route('/conversations', methods=['GET'])
+@require_auth
+@rate_limit('list_conversations')
+def list_conversations():
     """
-    Send a message and get AI response with RAG.
-    Uses document context from vector store.
-    """
-    service = ChatService(db)
+    List all conversations for the current user/tenant.
 
-    # Verify session
-    session = await service.get_session(session_id, tenant.id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Session not found"
+    Query params:
+    - include_archived: bool (default: false)
+    - limit: int (default: 50, max: 100)
+    - offset: int (default: 0)
+
+    Returns conversations sorted by last_message_at descending.
+    """
+    db = get_db()
+    try:
+        tenant_id = g.tenant_id
+        user_id = g.user_id
+
+        include_archived = request.args.get('include_archived', 'false').lower() == 'true'
+        limit = min(int(request.args.get('limit', 50)), 100)
+        offset = int(request.args.get('offset', 0))
+
+        # Subquery to count messages per conversation (avoids N+1)
+        message_count_subq = db.query(
+            ChatMessage.conversation_id,
+            func.count(ChatMessage.id).label('message_count')
+        ).filter(
+            ChatMessage.tenant_id == tenant_id
+        ).group_by(ChatMessage.conversation_id).subquery()
+
+        # Query conversations with message counts in single query
+        query = db.query(
+            ChatConversation,
+            func.coalesce(message_count_subq.c.message_count, 0).label('message_count')
+        ).outerjoin(
+            message_count_subq,
+            ChatConversation.id == message_count_subq.c.conversation_id
+        ).filter(
+            ChatConversation.tenant_id == tenant_id,
+            ChatConversation.user_id == user_id
         )
 
-    result = await service.chat(session_id, tenant.id, request.message)
-    return ChatResponse(**result)
+        if not include_archived:
+            query = query.filter(ChatConversation.is_archived == False)
 
-
-@router.post("/sessions/{session_id}/chat/stream")
-async def chat_stream(
-    session_id: UUID,
-    request: ChatRequest,
-    tenant: Tenant = Depends(get_current_tenant),
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Send a message and get streaming AI response.
-    Better UX for longer responses.
-    """
-    service = ChatService(db)
-
-    # Verify session
-    session = await service.get_session(session_id, tenant.id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Session not found"
+        # Sort: pinned first, then by last_message_at
+        query = query.order_by(
+            ChatConversation.is_pinned.desc(),
+            ChatConversation.last_message_at.desc()
         )
 
-    async def generate():
-        async for chunk in service.chat_stream(session_id, tenant.id, request.message):
-            yield f"data: {chunk}\n\n"
-        yield "data: [DONE]\n\n"
+        # Get total count (use window function approach for efficiency)
+        total_query = db.query(ChatConversation).filter(
+            ChatConversation.tenant_id == tenant_id,
+            ChatConversation.user_id == user_id
+        )
+        if not include_archived:
+            total_query = total_query.filter(ChatConversation.is_archived == False)
+        total = total_query.count()
 
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        }
-    )
+        # Apply pagination
+        results = query.offset(offset).limit(limit).all()
+
+        # Build response without triggering lazy loads
+        conversations_data = []
+        for conv, msg_count in results:
+            conversations_data.append({
+                "id": conv.id,
+                "tenant_id": conv.tenant_id,
+                "user_id": conv.user_id,
+                "title": conv.title,
+                "created_at": conv.created_at.isoformat() if conv.created_at else None,
+                "updated_at": conv.updated_at.isoformat() if conv.updated_at else None,
+                "last_message_at": conv.last_message_at.isoformat() if conv.last_message_at else None,
+                "is_archived": conv.is_archived,
+                "is_pinned": conv.is_pinned,
+                "message_count": msg_count
+            })
+
+        return jsonify({
+            "success": True,
+            "conversations": conversations_data,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+    finally:
+        db.close()
+
+
+@chat_bp.route('/conversations', methods=['POST'])
+@require_auth
+@rate_limit('create_conversation')
+def create_conversation():
+    """
+    Create a new conversation.
+
+    Request body:
+    {
+        "title": "Optional title" (optional - auto-generated if not provided)
+    }
+
+    Returns the created conversation.
+    """
+    db = get_db()
+    try:
+        tenant_id = g.tenant_id
+        user_id = g.user_id
+        data = request.get_json() or {}
+
+        conversation = ChatConversation(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            title=data.get('title'),
+            is_archived=False,
+            is_pinned=False
+        )
+
+        db.add(conversation)
+        db.commit()
+        db.refresh(conversation)
+
+        return jsonify({
+            "success": True,
+            "conversation": conversation.to_dict()
+        }), 201
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+    finally:
+        db.close()
+
+
+@chat_bp.route('/conversations/<conversation_id>', methods=['GET'])
+@require_auth
+def get_conversation(conversation_id: str):
+    """
+    Get a conversation with all its messages.
+
+    Returns the conversation with messages sorted by created_at ascending.
+    """
+    db = get_db()
+    try:
+        tenant_id = g.tenant_id
+        user_id = g.user_id
+
+        conversation = db.query(ChatConversation).filter(
+            ChatConversation.id == conversation_id,
+            ChatConversation.tenant_id == tenant_id,
+            ChatConversation.user_id == user_id
+        ).first()
+
+        if not conversation:
+            return jsonify({
+                "success": False,
+                "error": "Conversation not found"
+            }), 404
+
+        return jsonify({
+            "success": True,
+            "conversation": conversation.to_dict(include_messages=True)
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+    finally:
+        db.close()
+
+
+@chat_bp.route('/conversations/<conversation_id>', methods=['PUT'])
+@require_auth
+def update_conversation(conversation_id: str):
+    """
+    Update a conversation (title, archive status, pin status).
+
+    Request body:
+    {
+        "title": "New title" (optional),
+        "is_archived": true/false (optional),
+        "is_pinned": true/false (optional)
+    }
+    """
+    db = get_db()
+    try:
+        tenant_id = g.tenant_id
+        user_id = g.user_id
+        data = request.get_json() or {}
+
+        conversation = db.query(ChatConversation).filter(
+            ChatConversation.id == conversation_id,
+            ChatConversation.tenant_id == tenant_id,
+            ChatConversation.user_id == user_id
+        ).first()
+
+        if not conversation:
+            return jsonify({
+                "success": False,
+                "error": "Conversation not found"
+            }), 404
+
+        # Update fields if provided
+        if 'title' in data:
+            conversation.title = data['title']
+        if 'is_archived' in data:
+            conversation.is_archived = bool(data['is_archived'])
+        if 'is_pinned' in data:
+            conversation.is_pinned = bool(data['is_pinned'])
+
+        db.commit()
+        db.refresh(conversation)
+
+        return jsonify({
+            "success": True,
+            "conversation": conversation.to_dict()
+        })
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+    finally:
+        db.close()
+
+
+@chat_bp.route('/conversations/<conversation_id>', methods=['DELETE'])
+@require_auth
+def delete_conversation(conversation_id: str):
+    """
+    Delete a conversation and all its messages.
+    """
+    db = get_db()
+    try:
+        tenant_id = g.tenant_id
+        user_id = g.user_id
+
+        conversation = db.query(ChatConversation).filter(
+            ChatConversation.id == conversation_id,
+            ChatConversation.tenant_id == tenant_id,
+            ChatConversation.user_id == user_id
+        ).first()
+
+        if not conversation:
+            return jsonify({
+                "success": False,
+                "error": "Conversation not found"
+            }), 404
+
+        db.delete(conversation)  # Cascade deletes messages
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "Conversation deleted"
+        })
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+    finally:
+        db.close()
+
+
+# ============================================================================
+# MESSAGES
+# ============================================================================
+
+@chat_bp.route('/conversations/<conversation_id>/messages', methods=['POST'])
+@require_auth
+@rate_limit('add_message')
+def add_message(conversation_id: str):
+    """
+    Add a message to a conversation.
+
+    Request body:
+    {
+        "role": "user" or "assistant",
+        "content": "Message content",
+        "sources": [...] (optional - for assistant messages),
+        "metadata": {...} (optional)
+    }
+    """
+    db = get_db()
+    try:
+        tenant_id = g.tenant_id
+        user_id = g.user_id
+        data = request.get_json()
+
+        if not data:
+            return jsonify({
+                "success": False,
+                "error": "Request body is required"
+            }), 400
+
+        if not data.get('role') or not data.get('content'):
+            return jsonify({
+                "success": False,
+                "error": "role and content are required"
+            }), 400
+
+        if data['role'] not in ['user', 'assistant']:
+            return jsonify({
+                "success": False,
+                "error": "role must be 'user' or 'assistant'"
+            }), 400
+
+        # Validate content size to prevent abuse
+        if len(data['content']) > MAX_MESSAGE_LENGTH:
+            return jsonify({
+                "success": False,
+                "error": f"Message content exceeds maximum length of {MAX_MESSAGE_LENGTH} characters"
+            }), 400
+
+        # Verify conversation exists and belongs to user
+        conversation = db.query(ChatConversation).filter(
+            ChatConversation.id == conversation_id,
+            ChatConversation.tenant_id == tenant_id,
+            ChatConversation.user_id == user_id
+        ).first()
+
+        if not conversation:
+            return jsonify({
+                "success": False,
+                "error": "Conversation not found"
+            }), 404
+
+        # Create message
+        message = ChatMessage(
+            conversation_id=conversation_id,
+            tenant_id=tenant_id,
+            role=data['role'],
+            content=data['content'],
+            sources=data.get('sources', []),
+            extra_data=data.get('metadata', {})  # API accepts 'metadata', stored as 'extra_data'
+        )
+
+        db.add(message)
+
+        # Update conversation's last_message_at
+        conversation.last_message_at = datetime.now(timezone.utc)
+
+        # Auto-generate title if this is the first user message and no title set
+        if not conversation.title and data['role'] == 'user':
+            conversation.title = generate_title_from_content(data['content'])
+
+        db.commit()
+        db.refresh(message)
+
+        return jsonify({
+            "success": True,
+            "message": message.to_dict()
+        }), 201
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+    finally:
+        db.close()
+
+
+@chat_bp.route('/conversations/<conversation_id>/messages', methods=['GET'])
+@require_auth
+def get_messages(conversation_id: str):
+    """
+    Get all messages in a conversation.
+
+    Query params:
+    - limit: int (default: 100, max: 500)
+    - before_id: string (for pagination - get messages before this ID)
+    """
+    db = get_db()
+    try:
+        tenant_id = g.tenant_id
+        user_id = g.user_id
+
+        limit = min(int(request.args.get('limit', 100)), 500)
+        before_id = request.args.get('before_id')
+
+        # Verify conversation access
+        conversation = db.query(ChatConversation).filter(
+            ChatConversation.id == conversation_id,
+            ChatConversation.tenant_id == tenant_id,
+            ChatConversation.user_id == user_id
+        ).first()
+
+        if not conversation:
+            return jsonify({
+                "success": False,
+                "error": "Conversation not found"
+            }), 404
+
+        # Build query
+        query = db.query(ChatMessage).filter(
+            ChatMessage.conversation_id == conversation_id,
+            ChatMessage.tenant_id == tenant_id
+        )
+
+        if before_id:
+            # SECURITY: Include tenant_id filter to prevent cross-tenant probing
+            before_msg = db.query(ChatMessage).filter(
+                ChatMessage.id == before_id,
+                ChatMessage.tenant_id == tenant_id,
+                ChatMessage.conversation_id == conversation_id
+            ).first()
+            if before_msg:
+                query = query.filter(
+                    ChatMessage.created_at < before_msg.created_at
+                )
+
+        messages = query.order_by(
+            ChatMessage.created_at.asc()
+        ).limit(limit).all()
+
+        return jsonify({
+            "success": True,
+            "messages": [m.to_dict() for m in messages],
+            "conversation_id": conversation_id
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+    finally:
+        db.close()
+
+
+# ============================================================================
+# BULK OPERATIONS
+# ============================================================================
+
+@chat_bp.route('/conversations/bulk-archive', methods=['POST'])
+@require_auth
+def bulk_archive_conversations():
+    """
+    Archive multiple conversations.
+
+    Request body:
+    {
+        "conversation_ids": ["id1", "id2", ...]
+    }
+    """
+    db = get_db()
+    try:
+        tenant_id = g.tenant_id
+        user_id = g.user_id
+        data = request.get_json() or {}
+
+        conversation_ids = data.get('conversation_ids', [])
+        if not conversation_ids:
+            return jsonify({
+                "success": False,
+                "error": "conversation_ids is required"
+            }), 400
+
+        # Limit bulk operations to prevent abuse
+        if len(conversation_ids) > MAX_BULK_IDS:
+            return jsonify({
+                "success": False,
+                "error": f"Cannot process more than {MAX_BULK_IDS} conversations at once"
+            }), 400
+
+        updated = db.query(ChatConversation).filter(
+            ChatConversation.id.in_(conversation_ids),
+            ChatConversation.tenant_id == tenant_id,
+            ChatConversation.user_id == user_id
+        ).update(
+            {"is_archived": True},
+            synchronize_session=False
+        )
+
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "archived_count": updated
+        })
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+    finally:
+        db.close()
+
+
+@chat_bp.route('/conversations/bulk-delete', methods=['POST'])
+@require_auth
+def bulk_delete_conversations():
+    """
+    Delete multiple conversations.
+
+    Request body:
+    {
+        "conversation_ids": ["id1", "id2", ...]
+    }
+    """
+    db = get_db()
+    try:
+        tenant_id = g.tenant_id
+        user_id = g.user_id
+        data = request.get_json() or {}
+
+        conversation_ids = data.get('conversation_ids', [])
+        if not conversation_ids:
+            return jsonify({
+                "success": False,
+                "error": "conversation_ids is required"
+            }), 400
+
+        # Limit bulk operations to prevent abuse
+        if len(conversation_ids) > MAX_BULK_IDS:
+            return jsonify({
+                "success": False,
+                "error": f"Cannot process more than {MAX_BULK_IDS} conversations at once"
+            }), 400
+
+        deleted = db.query(ChatConversation).filter(
+            ChatConversation.id.in_(conversation_ids),
+            ChatConversation.tenant_id == tenant_id,
+            ChatConversation.user_id == user_id
+        ).delete(synchronize_session=False)
+
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "deleted_count": deleted
+        })
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+    finally:
+        db.close()
+
+
+# ============================================================================
+# SEARCH
+# ============================================================================
+
+@chat_bp.route('/search', methods=['GET'])
+@require_auth
+@rate_limit('search')
+def search_conversations():
+    """
+    Search conversations by content.
+
+    Query params:
+    - q: search query (required, 2-100 chars)
+    - limit: int (default: 20, max: 50)
+    """
+    db = get_db()
+    try:
+        tenant_id = g.tenant_id
+        user_id = g.user_id
+
+        query_text = request.args.get('q', '').strip()
+        if not query_text:
+            return jsonify({
+                "success": False,
+                "error": "Search query 'q' is required"
+            }), 400
+
+        # Validate query length
+        if len(query_text) < 2:
+            return jsonify({
+                "success": False,
+                "error": "Search query must be at least 2 characters"
+            }), 400
+
+        if len(query_text) > 100:
+            return jsonify({
+                "success": False,
+                "error": "Search query must be at most 100 characters"
+            }), 400
+
+        limit = min(int(request.args.get('limit', 20)), 50)
+
+        # Search in message content and conversation titles
+        # Using LIKE - for production, consider PostgreSQL full-text search or Elasticsearch
+        search_pattern = f"%{query_text}%"
+
+        # Use EXISTS for better performance than IN subquery
+        message_exists = db.query(ChatMessage.id).filter(
+            ChatMessage.conversation_id == ChatConversation.id,
+            ChatMessage.tenant_id == tenant_id,
+            ChatMessage.content.ilike(search_pattern)
+        ).exists()
+
+        # Find conversations with matching messages or titles
+        matching_conversations = db.query(ChatConversation).filter(
+            ChatConversation.tenant_id == tenant_id,
+            ChatConversation.user_id == user_id,
+            ChatConversation.is_archived == False
+        ).filter(
+            db.or_(
+                ChatConversation.title.ilike(search_pattern),
+                message_exists
+            )
+        ).order_by(
+            ChatConversation.last_message_at.desc()
+        ).limit(limit).all()
+
+        # Build response without lazy loading messages
+        conversations_data = [{
+            "id": c.id,
+            "title": c.title,
+            "last_message_at": c.last_message_at.isoformat() if c.last_message_at else None,
+            "is_pinned": c.is_pinned
+        } for c in matching_conversations]
+
+        return jsonify({
+            "success": True,
+            "query": query_text,
+            "conversations": conversations_data,
+            "count": len(matching_conversations)
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+    finally:
+        db.close()
