@@ -5,7 +5,7 @@ Run this locally to verify your Azure settings work
 import os
 from openai import AzureOpenAI
 
-# Your config - load from environment
+# Load config from environment
 from dotenv import load_dotenv
 load_dotenv()
 
