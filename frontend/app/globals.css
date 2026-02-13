@@ -2,116 +2,34 @@
 @tailwind components;
 @tailwind utilities;
 
-@layer base {
-  :root {
-    --background: 255 255 255;
-    --foreground: 15 23 42;
-    --muted: 241 245 249;
-    --muted-foreground: 100 116 139;
-    --border: 226 232 240;
-    --input: 226 232 240;
-    --ring: 14 165 233;
-    --primary: 14 165 233;
-    --primary-foreground: 255 255 255;
-  }
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Work+Sans:wght@400;500;600&display=swap');
 
-  .dark {
-    --background: 15 23 42;
-    --foreground: 248 250 252;
-    --muted: 30 41 59;
-    --muted-foreground: 148 163 184;
-    --border: 51 65 85;
-    --input: 51 65 85;
-    --ring: 56 189 248;
-    --primary: 56 189 248;
-    --primary-foreground: 15 23 42;
-  }
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
 }
 
-@layer base {
-  * {
-    @apply border-slate-200 dark:border-slate-700;
-  }
-
-  body {
-    @apply bg-white text-slate-900 dark:bg-slate-900 dark:text-slate-50;
-    font-feature-settings: "rlig" 1, "calt" 1;
-  }
+body {
+  font-family: 'Inter', sans-serif;
+  background: #FFFFFF;
 }
 
-@layer components {
-  .btn {
-    @apply inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 disabled:opacity-50 disabled:pointer-events-none;
-  }
-
-  .btn-primary {
-    @apply btn bg-primary-600 text-white hover:bg-primary-700;
-  }
-
-  .btn-secondary {
-    @apply btn bg-slate-100 text-slate-900 hover:bg-slate-200 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700;
-  }
-
-  .btn-ghost {
-    @apply btn hover:bg-slate-100 dark:hover:bg-slate-800;
-  }
-
-  .btn-danger {
-    @apply btn bg-red-600 text-white hover:bg-red-700;
-  }
-
-  .input {
-    @apply w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm placeholder:text-slate-400 focus:border-primary-500 focus:outline-none focus:ring-2 focus:ring-primary-500/20 disabled:opacity-50 dark:border-slate-600 dark:bg-slate-800 dark:placeholder:text-slate-500;
-  }
-
-  .card {
-    @apply rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900;
-  }
-
-  .link {
-    @apply text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300 underline-offset-4 hover:underline;
-  }
+/* Knowledge Gaps Page Animations */
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0.2), 0 0 0 16px rgba(239, 68, 68, 0.1); }
+  50% { box-shadow: 0 0 0 12px rgba(239, 68, 68, 0.3), 0 0 0 24px rgba(239, 68, 68, 0.15); }
 }
 
-/* Custom scrollbar */
-@layer utilities {
-  .scrollbar-thin {
-    scrollbar-width: thin;
-    scrollbar-color: rgb(148 163 184) transparent;
-  }
-
-  .scrollbar-thin::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
-  }
-
-  .scrollbar-thin::-webkit-scrollbar-track {
-    background: transparent;
-  }
-
-  .scrollbar-thin::-webkit-scrollbar-thumb {
-    background-color: rgb(148 163 184);
-    border-radius: 3px;
-  }
-
-  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
-    background-color: rgb(100 116 139);
-  }
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
 }
 
-/* Markdown styles for chat */
-.prose-chat {
-  @apply prose prose-slate dark:prose-invert prose-sm max-w-none;
+.animate-pulse-recording {
+  animation: pulse 1.5s ease-in-out infinite;
 }
 
-.prose-chat pre {
-  @apply bg-slate-100 dark:bg-slate-800 rounded-lg overflow-x-auto;
-}
-
-.prose-chat code {
-  @apply text-primary-600 dark:text-primary-400 bg-slate-100 dark:bg-slate-800 px-1 py-0.5 rounded text-sm;
-}
-
-.prose-chat pre code {
-  @apply bg-transparent p-0;
+.animate-spin {
+  animation: spin 0.8s linear infinite;
 }

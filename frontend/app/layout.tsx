@@ -1,25 +1,24 @@
-import type { Metadata } from 'next';
-import { Inter } from 'next/font/google';
-import './globals.css';
-import { Providers } from '@/components/providers';
-
-const inter = Inter({ subsets: ['latin'] });
+import './globals.css'
+import type { Metadata } from 'next'
+import { Providers } from '@/components/providers/Providers'
 
 export const metadata: Metadata = {
-  title: '2nd Brain - Your AI Knowledge Base',
-  description: 'AI-powered personal knowledge management system',
-};
+  title: '2nd Brain',
+  description: 'AI-Powered Knowledge Transfer System',
+}
 
 export default function RootLayout({
   children,
 }: {
-  children: React.ReactNode;
+  children: React.ReactNode
 }) {
   return (
-    <html lang="en" suppressHydrationWarning>
-      <body className={inter.className}>
-        <Providers>{children}</Providers>
+    <html lang="en">
+      <body>
+        <Providers>
+          {children}
+        </Providers>
       </body>
     </html>
-  );
+  )
 }
