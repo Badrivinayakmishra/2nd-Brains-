@@ -1583,11 +1583,25 @@ def onedrive_callback():
                 db.add(connector)
 
             db.commit()
+            connector_id = connector.id
             print(f"[OneDrive Callback] Successfully saved connector")
 
-            # Auto-sync DISABLED - blocks server due to Python GIL
+            # AUTO-SYNC on FIRST CONNECTION ONLY (no re-sync)
             if is_first_connection:
-                print(f"[OneDrive Callback] First connection - user can manually sync")
+                print(f"[OneDrive Callback] First connection - starting one-time auto-import")
+                # Start background import thread
+                def run_onedrive_import():
+                    _run_onedrive_first_import(
+                        connector_id=connector_id,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        access_token=tokens["access_token"],
+                        refresh_token=tokens["refresh_token"]
+                    )
+                import threading
+                thread = threading.Thread(target=run_onedrive_import)
+                thread.daemon = True
+                thread.start()
 
             return redirect(f"{FRONTEND_URL}/integrations?success=onedrive")
 
@@ -1596,6 +1610,134 @@ def onedrive_callback():
 
     except Exception as e:
         return redirect(f"{FRONTEND_URL}/integrations?error={str(e)}")
+
+
+def _run_onedrive_first_import(connector_id: str, tenant_id: str, user_id: str, access_token: str, refresh_token: str):
+    """
+    ONE-TIME import of OneDrive files on first connection.
+    This runs in a background thread - NO RE-SYNC capability.
+    """
+    import time
+    from connectors.onedrive_connector import OneDriveConnector
+    from connectors.base_connector import ConnectorConfig
+    from services.embedding_service import EmbeddingService
+    from services.extraction_service import ExtractionService
+
+    print(f"[OneDrive Import] Starting one-time import for tenant {tenant_id}")
+    start_time = time.time()
+
+    db = get_db()
+    try:
+        # Create connector instance
+        config = ConnectorConfig(
+            connector_type="onedrive",
+            user_id=user_id,
+            credentials={
+                "access_token": access_token,
+                "refresh_token": refresh_token
+            },
+            settings={
+                "file_types": [".pptx", ".ppt", ".xlsx", ".xls", ".docx", ".doc", ".pdf"],
+                "max_file_size_mb": 50
+            }
+        )
+
+        connector_instance = OneDriveConnector(config)
+
+        # Update connector status to syncing
+        connector = db.query(Connector).filter(Connector.id == connector_id).first()
+        if connector:
+            connector.status = ConnectorStatus.SYNCING
+            db.commit()
+
+        # Run sync (this is async, need event loop)
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            documents = loop.run_until_complete(connector_instance.sync(since=None))
+            print(f"[OneDrive Import] Retrieved {len(documents)} documents")
+
+            # Save documents to database
+            embedding_service = EmbeddingService()
+            extraction_service = ExtractionService()
+
+            for doc in documents:
+                # Check if document already exists
+                existing = db.query(Document).filter(
+                    Document.tenant_id == tenant_id,
+                    Document.external_id == doc.external_id
+                ).first()
+
+                if existing:
+                    print(f"[OneDrive Import] Skipping existing: {doc.title}")
+                    continue
+
+                # Create new document
+                new_doc = Document(
+                    tenant_id=tenant_id,
+                    connector_id=connector_id,
+                    external_id=doc.external_id,
+                    title=doc.title,
+                    content=doc.content,
+                    source=doc.source,
+                    source_type="onedrive",
+                    doc_type=doc.doc_type,
+                    file_type=doc.metadata.get("file_type", "unknown"),
+                    metadata=doc.metadata,
+                    status=DocumentStatus.PENDING,
+                    created_at=utc_now()
+                )
+                db.add(new_doc)
+                db.flush()
+
+                # Extract structured summary
+                try:
+                    extraction_service.extract_and_save(new_doc, db)
+                except Exception as e:
+                    print(f"[OneDrive Import] Extraction failed for {doc.title}: {e}")
+
+                # Generate embeddings
+                try:
+                    embedding_service.embed_document(new_doc, tenant_id, db)
+                    new_doc.status = DocumentStatus.COMPLETED
+                except Exception as e:
+                    print(f"[OneDrive Import] Embedding failed for {doc.title}: {e}")
+                    new_doc.status = DocumentStatus.FAILED
+
+                db.commit()
+                print(f"[OneDrive Import] Imported: {doc.title}")
+
+            # Update connector status
+            if connector:
+                connector.status = ConnectorStatus.CONNECTED
+                connector.last_sync_at = utc_now()
+                connector.error_message = None
+                db.commit()
+
+            elapsed = time.time() - start_time
+            print(f"[OneDrive Import] Completed in {elapsed:.1f}s - {len(documents)} documents imported")
+
+        finally:
+            loop.close()
+
+    except Exception as e:
+        print(f"[OneDrive Import] ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+        # Update connector with error
+        try:
+            connector = db.query(Connector).filter(Connector.id == connector_id).first()
+            if connector:
+                connector.status = ConnectorStatus.ERROR
+                connector.error_message = str(e)[:500]
+                db.commit()
+        except:
+            pass
+    finally:
+        db.close()
 
 
 # ============================================================================
